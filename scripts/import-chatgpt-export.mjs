@@ -1,7 +1,17 @@
 #!/usr/bin/env node
 
 import { createHash } from "node:crypto";
-import { createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import {
+  copyFileSync,
+  createWriteStream,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, extname, join, resolve } from "node:path";
@@ -45,16 +55,13 @@ function findConversationFiles(root) {
 
 function expandNestedArchives(root) {
   const handled = new Set();
-  let round = 0;
-  while (round < 4) {
+  for (let round = 0; round < 4; round += 1) {
     const archives = walk(root, (name, fullPath) => extname(name).toLowerCase() === ".zip" && !handled.has(fullPath));
     if (!archives.length) return;
     for (const archive of archives) {
       handled.add(archive);
-      const destination = `${archive}.extracted`;
-      extractZip(archive, destination);
+      extractZip(archive, `${archive}.extracted`);
     }
-    round += 1;
   }
 }
 
@@ -63,24 +70,54 @@ function textFromMessage(message) {
   if (!Array.isArray(parts)) return "";
   return parts.map((part) => {
     if (typeof part === "string") return part;
-    if (part && typeof part === "object") return part.text ?? part.content ?? "";
+    if (part && typeof part === "object") {
+      const value = part.text ?? part.content ?? part.caption ?? "";
+      return typeof value === "string" ? value : JSON.stringify(value);
+    }
     return "";
   }).filter(Boolean).join("\n").trim();
 }
 
 function orderedMessages(conversation) {
-  return Object.values(conversation?.mapping ?? {}).map((node) => node?.message).filter(Boolean).map((message) => ({
-    id: message.id,
-    role: message.author?.role ?? "unknown",
-    name: message.author?.name ?? null,
-    createTime: message.create_time ?? null,
-    updateTime: message.update_time ?? null,
-    status: message.status ?? null,
-    contentType: message.content?.content_type ?? null,
-    text: textFromMessage(message),
-    metadata: message.metadata ?? {},
-  })).filter((message) => message.text || message.contentType !== "text")
+  return Object.values(conversation?.mapping ?? {})
+    .map((node) => node?.message)
+    .filter(Boolean)
+    .map((message) => ({
+      id: message.id,
+      role: message.author?.role ?? "unknown",
+      name: message.author?.name ?? null,
+      createTime: message.create_time ?? null,
+      updateTime: message.update_time ?? null,
+      status: message.status ?? null,
+      contentType: message.content?.content_type ?? null,
+      text: textFromMessage(message),
+      metadata: message.metadata ?? {},
+    }))
+    .filter((message) => message.text || message.contentType !== "text")
     .sort((a, b) => (a.createTime ?? 0) - (b.createTime ?? 0));
+}
+
+function importAuxiliaryKnowledge(exportRoot, outputPath) {
+  const auxiliaryDir = join(outputPath, "auxiliary");
+  mkdirSync(auxiliaryDir, { recursive: true });
+  const wanted = new Set([
+    "library.json",
+    "memory_feedback.json",
+    "shared_conversations.json",
+    "user.json",
+    "user_settings.json",
+    "export_manifest.json",
+    "conversations_associated_file_names.json",
+  ]);
+  const files = walk(exportRoot, (name) => wanted.has(name.toLowerCase()));
+  const imported = [];
+  for (const source of files) {
+    const target = join(auxiliaryDir, basename(source));
+    copyFileSync(source, target);
+    imported.push({ name: basename(source), sizeBytes: statSync(source).size });
+  }
+  writeFileSync(join(auxiliaryDir, "index.json"), JSON.stringify({ files: imported }, null, 2));
+  return imported;
 }
 
 const inputPath = resolve(arg("input", DEFAULT_EXPORT));
@@ -108,15 +145,16 @@ if (!conversationFiles.length) {
   }
 }
 if (!conversationFiles.length) {
-  const jsonExamples = walk(exportRoot, (name) => extname(name).toLowerCase() === ".json").slice(0, 12).map(basename);
-  const hint = jsonExamples.length ? ` Gefundene JSON-Dateien: ${jsonExamples.join(", ")}` : " Es wurden überhaupt keine JSON-Dateien gefunden.";
-  fail(`Keine conversations.json oder conversations-*.json gefunden.${hint}`);
+  const jsonExamples = walk(exportRoot, (name) => extname(name).toLowerCase() === ".json")
+    .slice(0, 20)
+    .map((file) => basename(file));
+  fail(`Keine conversations.json oder conversations-*.json gefunden. Gefundene JSON-Dateien: ${jsonExamples.join(", ") || "keine"}`);
 }
 
-log(`${conversationFiles.length} Konversationsdatei(en) gefunden.`);
+log(`${conversationFiles.length} Konversationsdatei(en) gefunden: ${conversationFiles.map((file) => basename(file)).join(", ")}`);
 const conversations = [];
 for (const file of conversationFiles) {
-  log(`Lese ${file} …`);
+  log(`Lese ${basename(file)} …`);
   try {
     const parsed = JSON.parse(readFileSync(file, "utf8"));
     if (Array.isArray(parsed)) conversations.push(...parsed);
@@ -126,26 +164,32 @@ for (const file of conversationFiles) {
     fail(`${basename(file)} ist ungültig: ${error instanceof Error ? error.message : String(error)}`);
   }
 }
-if (!conversations.length) fail("Die gefundenen Konversationsdateien enthalten keine lesbaren Konversationen.");
+if (!conversations.length) fail("Die Konversationsdateien enthalten keine lesbaren Konversationen.");
 
 const statePath = join(outputPath, "import-state.json");
 let previousState = { conversationHashes: {} };
 if (existsSync(statePath)) {
-  try { previousState = JSON.parse(readFileSync(statePath, "utf8")); } catch { /* sauber neu aufbauen */ }
+  try { previousState = JSON.parse(readFileSync(statePath, "utf8")); } catch { /* vollständiger Neuaufbau */ }
 }
 
 const conversationsStream = createWriteStream(join(outputPath, "conversations.jsonl"), { encoding: "utf8" });
 const messagesStream = createWriteStream(join(outputPath, "messages.jsonl"), { encoding: "utf8" });
 const nextHashes = {};
-let newCount = 0, changedCount = 0, unchangedCount = 0, messageCount = 0;
+let newCount = 0;
+let changedCount = 0;
+let unchangedCount = 0;
+let messageCount = 0;
 
 for (let index = 0; index < conversations.length; index += 1) {
   const conversation = conversations[index];
   const id = conversation.id ?? conversation.conversation_id ?? sha256(`${conversation.title ?? ""}:${conversation.create_time ?? index}`);
   const messages = orderedMessages(conversation);
   const normalized = {
-    id, title: conversation.title ?? "Ohne Titel", createTime: conversation.create_time ?? null,
-    updateTime: conversation.update_time ?? null, currentNode: conversation.current_node ?? null,
+    id,
+    title: conversation.title ?? "Ohne Titel",
+    createTime: conversation.create_time ?? null,
+    updateTime: conversation.update_time ?? null,
+    currentNode: conversation.current_node ?? null,
     messageCount: messages.length,
   };
   const hash = sha256(JSON.stringify({ normalized, messages }));
@@ -153,6 +197,7 @@ for (let index = 0; index < conversations.length; index += 1) {
   if (!previousState.conversationHashes?.[id]) newCount += 1;
   else if (previousState.conversationHashes[id] !== hash) changedCount += 1;
   else unchangedCount += 1;
+
   conversationsStream.write(`${JSON.stringify(normalized)}\n`);
   for (const message of messages) {
     messagesStream.write(`${JSON.stringify({ conversationId: id, conversationTitle: normalized.title, ...message })}\n`);
@@ -168,9 +213,10 @@ await Promise.all([
   new Promise((done, reject) => messagesStream.end((error) => error ? reject(error) : done())),
 ]);
 
+const auxiliaryFiles = importAuxiliaryKnowledge(exportRoot, outputPath);
 const importedAt = new Date().toISOString();
 const manifest = {
-  schemaVersion: 2,
+  schemaVersion: 3,
   source: "openai-chatgpt-data-export",
   sourceArchive: statSync(inputPath).isFile() ? basename(inputPath) : basename(exportRoot),
   sourceSizeBytes: statSync(inputPath).isFile() ? statSync(inputPath).size : null,
@@ -178,12 +224,15 @@ const manifest = {
   conversationSourceFiles: conversationFiles.map((file) => basename(file)),
   conversations: conversations.length,
   messages: messageCount,
+  auxiliaryFiles,
   delta: { new: newCount, changed: changedCount, unchanged: unchangedCount },
-  files: ["conversations.jsonl", "messages.jsonl", "manifest.json", "import-state.json"],
+  files: ["conversations.jsonl", "messages.jsonl", "manifest.json", "import-state.json", "auxiliary/index.json"],
 };
 writeFileSync(join(outputPath, "manifest.json"), JSON.stringify(manifest, null, 2));
-writeFileSync(statePath, JSON.stringify({ schemaVersion: 2, importedAt, conversationHashes: nextHashes }, null, 2));
+writeFileSync(statePath, JSON.stringify({ schemaVersion: 3, importedAt, conversationHashes: nextHashes }, null, 2));
+
 if (temporaryRoot && !keepExtracted) rmSync(temporaryRoot, { recursive: true, force: true });
 log(`IMPORT ABGESCHLOSSEN — ${conversations.length} Konversationen, ${messageCount} Nachrichten.`);
 log(`Neu: ${newCount}, geändert: ${changedCount}, unverändert: ${unchangedCount}.`);
+log(`Zusatzwissen: ${auxiliaryFiles.length} Datei(en).`);
 log(`Ausgabe: ${outputPath}`);
