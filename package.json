@@ -14,7 +14,8 @@
     "validate:artifact": "bash scripts/validate-artifact.sh",
     "lint": "bash scripts/sites-env.sh -- eslint . --ignore-pattern dist --ignore-pattern .next",
     "db:generate": "bash scripts/sites-env.sh -- drizzle-kit generate",
-    "import:chatgpt": "node scripts/import-chatgpt-export.mjs"
+    "import:chatgpt": "node scripts/import-chatgpt-export.mjs",
+    "memory:start": "node scripts/memory-bridge.mjs"
   },
   "dependencies": {
     "drizzle-orm": "0.45.2",
